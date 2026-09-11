@@ -127,6 +127,8 @@ final class SystemMonitor: ObservableObject {
     private let defaults = UserDefaults.standard
     private var timerCancellable: AnyCancellable?
     private var isMonitoring = false
+    private var isRefreshInProgress = false
+    private var monitoringGeneration = 0
     private var powerSamples: [Double] = []
     private let maximumSampleCount = 30
     private static let selectedSensorsDefaultsKey = "selectedSensorKeys"
@@ -204,12 +206,14 @@ final class SystemMonitor: ObservableObject {
     func startMonitoring() {
         guard !isMonitoring else { return }
         isMonitoring = true
+        monitoringGeneration += 1
         refreshNow()
         configureTimer()
     }
 
     func stopMonitoring() {
         isMonitoring = false
+        monitoringGeneration += 1
         timerCancellable?.cancel()
         timerCancellable = nil
     }
@@ -232,10 +236,41 @@ final class SystemMonitor: ObservableObject {
     }
 
     func refreshNow() {
+        // Sensor and power source APIs can block while talking to the hardware.
+        // Keep them off the main actor so opening the menu bar window stays smooth.
+        guard !isRefreshInProgress else { return }
+        isRefreshInProgress = true
         isLoading = sensors.isEmpty
 
-        do {
-            let readings = try reader.readAllSensors() + metricsReader.readMetrics()
+        let reader = self.reader
+        let metricsReader = self.metricsReader
+        let generation = monitoringGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<[SensorReading], Error>
+            do {
+                result = .success(try reader.readAllSensors() + metricsReader.readMetrics())
+            } catch {
+                result = .failure(error)
+            }
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isRefreshInProgress = false
+                // The menu may have been closed while hardware access was in progress.
+                // Ignore stale results so closing the menu truly stops monitoring.
+                guard self.isMonitoring, self.monitoringGeneration == generation else {
+                    // If the menu was reopened, immediately start a fresh sample.
+                    if self.isMonitoring { self.refreshNow() }
+                    return
+                }
+                self.applyRefreshResult(result)
+            }
+        }
+    }
+
+    private func applyRefreshResult(_ result: Result<[SensorReading], Error>) {
+        switch result {
+        case .success(let readings):
             sensors = readings.sorted {
                 if $0.kind != $1.kind {
                     return SensorKind.allCases.firstIndex(of: $0.kind)! < SensorKind.allCases.firstIndex(of: $1.kind)!
@@ -249,10 +284,9 @@ final class SystemMonitor: ObservableObject {
             errorMessage = nil
             isUsingFallback = reader.isUsingRegistryFallback
             lastUpdated = Date()
-        } catch {
+        case .failure(let error):
             errorMessage = error.localizedDescription
         }
-
         isLoading = false
     }
 
